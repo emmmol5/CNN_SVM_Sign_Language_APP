@@ -1,0 +1,190 @@
+import os
+import random
+import torch
+import cv2
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, classification_report, precision_score, recall_score, f1_score
+from sklearn.preprocessing import LabelEncoder
+from torchvision import models, transforms
+import joblib
+from collections import Counter
+
+
+'''
+Building a sign language video classifier using:
+
+* Pretrained MobileNetV2 to extract visual features from frames
+
+* Support Vector Machine for classification
+
+* A dataset of 720 sign classes, each with 11 short videos
+'''
+
+# Configuration
+
+data_root = "ResizedVideos_224" 
+num_train = 8
+num_val = 1
+num_test = 2
+limit_classes = None  # For quick testing (None when using the whole dataset)
+
+test_feature_path = "test_features.npy"
+test_label_path = "test_labels.npy"
+label_encoder_path = "label_encoder.pkl"
+
+# Preprocessing 
+
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+# Feature Extractor
+#   Loads a pretrained MobileNetV2 (only convolutional layers, no classifier). 
+#   It’s frozen (eval()), and used to extract deep image features.
+
+model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT).features.eval().cuda()
+
+
+# Loads a video with OpenCV
+# Takes every 2nd frame (using frame_idx % 2)
+# Applies the transform pipeline
+# Passes each frame through MobileNetV2
+# Averages all extracted features → final shape: [1280,]
+# Have 1 fixed-length vector per video
+
+@torch.no_grad()
+
+def extract_video_feature(video_path, max_frames=64):
+    cap = cv2.VideoCapture(video_path)
+    frame_features = []
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % 2 == 0: 
+            # cropped = crop_body_from_frame(frame)  
+            cropped = frame  # Use full frame
+
+            rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb)
+            tensor = transform(pil_img).unsqueeze(0).cuda()
+            feature = model(tensor).mean([2, 3]).squeeze().cpu().numpy()
+            frame_features.append(feature)
+
+            if len(frame_features) >= max_frames:
+                break
+
+        frame_idx += 1
+
+
+    cap.release()
+    if len(frame_features) == 0:
+        return np.zeros((1280,))
+    return np.mean(frame_features, axis=0)
+
+# Load Data and Split
+#   Shuffle the videos
+#   Split into train/val/test
+#   Extract features from each and store the vector in the appropriate list
+train_X, val_X, test_X = [], [], []
+train_y, val_y, test_y = [], [], []
+labels = []
+
+print("Loading and splitting data...")
+class_dirs = sorted([d for d in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, d))])
+if limit_classes:
+    class_dirs = class_dirs[:limit_classes]
+
+for class_name in tqdm(class_dirs):
+    class_dir = os.path.join(data_root, class_name)
+    video_files = [os.path.join(class_dir, f) for f in os.listdir(class_dir) if f.endswith('.mp4')]
+    if len(video_files) < num_train + num_val + num_test:
+        continue
+
+    random.shuffle(video_files)
+    train_videos = video_files[:num_train]
+    val_videos = video_files[num_train:num_train+num_val]
+    test_videos = video_files[num_train+num_val:num_train+num_val+num_test]
+
+    for path in train_videos:
+        train_X.append(extract_video_feature(path))
+        train_y.append(class_name)
+
+    for path in val_videos:
+        val_X.append(extract_video_feature(path))
+        val_y.append(class_name)
+
+    for path in test_videos:
+        test_X.append(extract_video_feature(path))
+        test_y.append(class_name)
+
+
+# Encode Labels
+
+le = LabelEncoder()
+le.fit(train_y + val_y + test_y)
+
+train_y_encoded = le.transform(train_y)
+val_y_encoded = le.transform(val_y)
+test_y_encoded = le.transform(test_y)
+
+
+np.save(test_feature_path, np.array(test_X))
+np.save(test_label_path, np.array(test_y_encoded))
+joblib.dump(le, label_encoder_path)
+
+np.save("train_features.npy", np.array(train_X))
+np.save("val_features.npy", np.array(val_X))
+np.save("train_labels.npy", np.array(train_y_encoded))
+np.save("val_labels.npy", np.array(val_y_encoded))
+
+
+print("Saved test_features.npy, test_labels.npy, and label_encoder.pkl")
+
+# Train SVM and Evaluate
+#  Trains a linear SVM to find optimal decision boundaries between sign classes
+#  It learns using the 1280-dim features from MobileNetV2
+
+svm = SVC(kernel='linear', probability=True)
+svm.fit(train_X, train_y_encoded)
+
+# Saving the trained classifier to disk so it can be reloaded later without retraining
+joblib.dump(svm, r"C:\Users\erlen\OneDrive\Emma\CNN_LSTM_SIGN_LANGUAGE_PROJECT\Last_test\svm_sign_language_model.pkl")
+print("Model saved to svm_sign_language_model.pkl")
+
+print("Class distribution:", Counter(train_y))
+
+# Evaluate on Validation and Test Sets
+#   Predict the labels on val and test sets
+#   Calculate accuracy, precision, recall, and F1
+#   Print a per-class report showing which signs worked well or not
+
+'''val_pred = svm.predict(val_X)
+val_acc = accuracy_score(val_y_encoded, val_pred)
+val_precision = precision_score(val_y_encoded, val_pred, average='macro', zero_division=0)
+val_recall = recall_score(val_y_encoded, val_pred, average='macro', zero_division=0)
+val_f1 = f1_score(val_y_encoded, val_pred, average='macro', zero_division=0)
+
+print(f"\nValidation Results:")
+print(f"| Val Acc: {val_acc:.4f} | Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")'''
+
+test_pred = svm.predict(test_X)
+test_acc = accuracy_score(test_y_encoded, test_pred)
+test_precision = precision_score(test_y_encoded, test_pred, average='macro', zero_division=0)
+test_recall = recall_score(test_y_encoded, test_pred, average='macro', zero_division=0)
+test_f1 = f1_score(test_y_encoded, test_pred, average='macro', zero_division=0)
+
+print("\nTest Results:")
+print(f"Test Acc: {test_acc:.4f} | Precision: {test_precision:.4f} | Recall: {test_recall:.4f} | F1: {test_f1:.4f}")
+
+#print("\nTest Classification Report:")
+#print(classification_report(test_y_encoded, test_pred, target_names=le.classes_))
