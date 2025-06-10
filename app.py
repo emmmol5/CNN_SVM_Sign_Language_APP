@@ -1,5 +1,7 @@
 import streamlit as st
 import torch
+import torchvision
+from torchvision.models import mobilenet_v2
 import torchvision.transforms as transforms
 import cv2
 import numpy as np
@@ -7,7 +9,8 @@ from PIL import Image
 import joblib
 
 # Load the MobileNetV2 feature extractor
-mobilenet = torch.hub.load('pytorch/vision:v0.10.0', 'mobilenet_v2', pretrained=True)
+#mobilenet = torch.hub.load('pytorch/vision:v0.10.0', 'mobilenet_v2', pretrained=True)
+mobilenet = mobilenet_v2(pretrained=True)
 mobilenet.classifier = torch.nn.Identity()  # Remove classification layer
 mobilenet.eval()
 
